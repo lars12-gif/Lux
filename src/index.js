@@ -2,10 +2,12 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import qrcode from 'qrcode-terminal';
+import pino from 'pino';
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  Browsers
 } from '@itsliaaa/baileys';
 import { getDB, saveDB } from './storage.js';
 import { getForm, RANKS, POINT_RULES } from './forms.js';
@@ -16,6 +18,7 @@ const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || OWNER).replace(/\D/g, '');
 const AUTH_DIR = path.resolve('auth');
 const db = getDB();
+const logger = pino({ level: process.env.LOG_LEVEL || 'warn' });
 let sock;
 let reconnecting = false;
 
@@ -184,21 +187,27 @@ async function start() {
     auth: state,
     version,
     printQRInTerminal: false,
-    browser: ['LUX BOT', 'Chrome', '1.0.0'],
-    logger: { level: 'silent', trace(){}, debug(){}, info(){}, warn: log, error: log, fatal: log, child(){ return this; } },
+    browser: Browsers.ubuntu('Chrome'),
+    logger,
     markOnlineOnConnect: false,
     syncFullHistory: false
   });
 
   sock.ev.on('creds.update', saveCreds);
+  let pendingQr = null;
+  let pairingFinished = false;
+
+  const showQrFallback = qr => {
+    if (!qr || pairingFinished || sock.__luxPairingCodePrinted) return;
+    console.log('رمز الاقتران لم يصدر؛ هذا QR بديل للربط:');
+    qrcode.generate(qr, { small: true });
+  };
+
   sock.ev.on('connection.update', async update => {
     const { connection, lastDisconnect, qr } = update;
     if (qr && !state.creds.registered) {
-      // QR fallback if pairing-code mode is unavailable.
-      if (!sock.__luxPairingCodePrinted) {
-        console.log('\\nرمز الاقتران لم يظهر؛ امسح QR من واتساب > الأجهزة المرتبطة > ربط جهاز.\\n');
-        qrcode.generate(qr, { small: true });
-      }
+      pendingQr = qr;
+      if (pairingFinished) showQrFallback(pendingQr);
     }
     if (connection === 'open') {
       log('تم الاتصال بواتساب كـ', sock.user?.id);
@@ -226,16 +235,25 @@ async function start() {
     }
   });
 
-  // Request the pairing code directly after socket initialization.
-  if (!state.creds.registered && PAIRING_NUMBER && typeof sock.requestPairingCode === 'function') {
+  // نفس آلية البوت القديم: انتظر قليلاً بعد إنشاء الاتصال ثم اطلب رمز الاقتران.
+  if (!state.creds.registered && PAIRING_NUMBER) {
+    await new Promise(resolve => setTimeout(resolve, 1500));
     try {
+      if (typeof sock.requestPairingCode !== 'function') {
+        throw new Error('requestPairingCode غير متوفرة في إصدار Baileys المثبت.');
+      }
       const code = await sock.requestPairingCode(PAIRING_NUMBER);
+      pairingFinished = true;
       sock.__luxPairingCodePrinted = true;
-      console.log('\\nرمز اقتران LUX BOT: ' + code);
-      console.log('واتساب > الأجهزة المرتبطة > ربط جهاز > الربط برقم الهاتف، ثم أدخل الرمز.\\n');
+      console.log('\n================================');
+      console.log('رمز اقتران LUX BOT:', code);
+      console.log('================================');
+      console.log('واتساب > الأجهزة المرتبطة > ربط جهاز > الربط برقم الهاتف، ثم أدخل الرمز.\n');
     } catch (e) {
-      log('تعذر إصدار رمز الاقتران:', e.message);
-      log('إذا ظهر QR، استخدمه كطريقة بديلة للربط.');
+      pairingFinished = true;
+      log('تعذر إصدار رمز الاقتران:', e?.message || e);
+      if (pendingQr) showQrFallback(pendingQr);
+      else log('لم يصل QR أيضاً؛ راجع إصدار Baileys وأخطاء الاتصال أعلاه.');
     }
   }
 }
