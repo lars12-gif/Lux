@@ -2,19 +2,16 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import makeWASocket, {
-  Browsers,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion
-} from 'baileys';
-import pino from 'pino';
+} from '@itsliaaa/baileys';
 import { getDB, saveDB } from './storage.js';
 import { getForm, RANKS, POINT_RULES } from './forms.js';
 import { createLuxGroups } from './groups.js';
 
 const PREFIX = process.env.PREFIX || '!lux';
 const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
-const PAIRING_CODE = (process.env.PAIRING_CODE || 'LUX2026A').trim();
 const AUTH_DIR = path.resolve('auth');
 const db = getDB();
 let sock;
@@ -25,18 +22,50 @@ const log = (...args) => console.log(new Date().toISOString(), ...args);
 const jidFromNumber = n => `${String(n).replace(/\D/g, '')}@s.whatsapp.net`;
 const senderNumber = jid => (jid || '').split('@')[0].split(':')[0].replace(/\D/g, '');
 const isOwner = jid => senderNumber(jid) === OWNER;
-const isAdmin = jid => isOwner(jid) || (process.env.ADMIN_NUMBERS || '').split(',').map(x => x.trim().replace(/\D/g, '')).includes(senderNumber(jid));
+function senderCandidates(msg) {
+  const keys = [
+    msg?.key?.participant,
+    msg?.key?.participantAlt,
+    msg?.key?.remoteJid,
+    msg?.key?.remoteJidAlt,
+    msg?.participant
+  ].filter(Boolean);
+  return [...new Set(keys.map(senderNumber).filter(Boolean))];
+}
+function isAdminMessage(msg) {
+  const allowed = [OWNER, ...(process.env.ADMIN_NUMBERS || '').split(',').map(x => x.trim().replace(/\D/g, ''))].filter(Boolean);
+  return senderCandidates(msg).some(number => allowed.includes(number));
+}
+
+function unwrapMessageContent(content) {
+  let current = content || {};
+  // WhatsApp may wrap ordinary messages in ephemeral/view-once/edit containers.
+  for (let i = 0; i < 6; i++) {
+    const wrapped = current.ephemeralMessage?.message ||
+      current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message ||
+      current.viewOnceMessageV2Extension?.message ||
+      current.documentWithCaptionMessage?.message ||
+      current.editedMessage?.message;
+    if (!wrapped) break;
+    current = wrapped;
+  }
+  return current;
+}
 
 function getText(message) {
-  const m = message?.message || {};
+  const m = unwrapMessageContent(message?.message);
   return m.conversation || m.extendedTextMessage?.text ||
     m.imageMessage?.caption || m.videoMessage?.caption ||
     m.documentMessage?.caption || m.buttonsResponseMessage?.selectedButtonId ||
-    m.listResponseMessage?.singleSelectReply?.selectedRowId || '';
+    m.templateButtonReplyMessage?.selectedId ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    m.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson || '';
 }
 
 async function send(jid, text) {
   if (!jid) throw new Error('وجهة الإرسال غير محددة.');
+  if (!sock) throw new Error('البوت غير متصل حالياً.');
   return sock.sendMessage(jid, { text });
 }
 
@@ -107,14 +136,17 @@ async function handleCommand(msg) {
   const jid = msg.key.remoteJid;
   const sender = msg.key.participant || msg.key.remoteJid;
   const text = getText(msg).trim();
-  if (!text.toLowerCase().startsWith(PREFIX.toLowerCase())) return;
-  const rest = text.slice(PREFIX.length).trim();
+  const prefix = PREFIX.trim();
+  if (!text.toLowerCase().startsWith(prefix.toLowerCase())) return;
+  const rest = text.slice(prefix.length).trim();
   const [commandRaw, ...args] = rest.split(/\s+/);
   const command = (commandRaw || 'help').toLowerCase();
   const argText = rest.slice(commandRaw?.length || 0).trim();
 
-  if (command === 'help' || command === 'مساعدة') return send(jid, helpText());
-  if (!isAdmin(sender)) return send(jid, 'هذا الأمر للإدارة فقط.');
+  log('[MSG] أمر وارد:', command, '| chat:', jid, '| sender:', senderCandidates(msg).join(','));
+  if (command === 'help' || command === 'مساعدة' || command === 'الاوامر' || command === 'الأوامر') return send(jid, helpText());
+  if (command === 'ping' || command === 'test') return send(jid, '♛ LUX BOT يعمل ويستقبل الرسائل بنجاح.');
+  if (!isAdminMessage(msg)) return send(jid, 'هذا الأمر للإدارة فقط. تأكد أن OWNER_NUMBER في الاستضافة هو رقمك مع مفتاح الدولة، أرقام فقط.');
 
   try {
     if (command === 'status') {
@@ -187,19 +219,16 @@ async function requestPairingCode(activeSocket, generation, state) {
     return;
   }
 
-  // MeowSab/Reze style: request the code after the socket emits its initial QR event.
-  await new Promise(resolve => setTimeout(resolve, 3000));
+  // نفس تسلسل كود الربط الذي أرسلته: انتظار قصير ثم طلب الرمز من نفس socket.
+  await new Promise(resolve => setTimeout(resolve, 1500));
   if (generation !== socketGeneration || sock !== activeSocket || state.creds.registered) return;
 
   try {
     if (typeof activeSocket.requestPairingCode !== 'function') {
-      throw new Error('مكتبة Baileys الحالية لا توفّر requestPairingCode().');
+      throw new Error('إصدار @itsliaaa/baileys الحالي لا يوفّر requestPairingCode().');
     }
-    if (PAIRING_CODE.length !== 8) {
-      throw new Error('PAIRING_CODE يجب أن يكون 8 أحرف بالضبط (حروف/أرقام).');
-    }
-    log('[PAIRING] جاري طلب رمز الربط المخصص لرقم المؤسس...');
-    const code = await activeSocket.requestPairingCode(OWNER, PAIRING_CODE);
+    log('[PAIRING] جاري طلب رمز الربط لرقم المؤسس...');
+    const code = await activeSocket.requestPairingCode(OWNER);
     console.log('\n================================');
     console.log('LUX WHATSAPP PAIRING CODE:', code);
     console.log('================================\n');
@@ -224,8 +253,8 @@ async function start() {
       auth: state,
       version,
       printQRInTerminal: false,
-      browser: Browsers.ubuntu('Chrome'),
-      logger: pino({ level: 'silent' }),
+      browser: ['LUX BOT', 'Chrome', '1.0.0'],
+      logger: { level: 'silent', trace(){}, debug(){}, info(){}, warn: log, error: log, fatal: log, child(){ return this; } },
       markOnlineOnConnect: false,
       syncFullHistory: false
     });
@@ -263,23 +292,25 @@ async function start() {
       }
     });
 
-    activeSocket.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+    activeSocket.ev.on('messages.upsert', async ({ messages = [], type }) => {
+      // Some Baileys builds deliver live messages as notify and append.
+      if (type !== 'notify' && type !== 'append') return;
       for (const msg of messages) {
-        if (!msg.message || msg.key.fromMe) continue;
+        if (!msg?.message) continue;
+        const text = getText(msg).trim();
+        if (!text.toLowerCase().startsWith(PREFIX.trim().toLowerCase())) continue;
+        // Allow the owner to test commands in a private chat with the bot too.
         try { await handleCommand(msg); }
-        catch (e) { log('Message handler error:', e); }
+        catch (e) {
+          log('[MSG] Message handler error:', e?.stack || e);
+          try { await send(msg.key.remoteJid, `صار خطأ أثناء تنفيذ الأمر: ${e.message || e}`); }
+          catch (sendError) { log('[MSG] تعذر إرسال رد الخطأ:', sendError?.message || sendError); }
+        }
       }
     });
 
-    // Reze/MeowSab style: wait for the socket's QR event, then request a custom pairing code.
-    let pairingRequested = false;
-    activeSocket.ev.on('connection.update', update => {
-      if (update.qr && !pairingRequested && !state.creds.registered) {
-        pairingRequested = true;
-        void requestPairingCode(activeSocket, generation, state);
-      }
-    });
+    // طلب رمز الربط تلقائياً عند أول تشغيل، مثل الكود المرجعي المرسل.
+    if (!state.creds.registered) void requestPairingCode(activeSocket, generation, state);
   } catch (err) {
     reconnecting = false;
     log('[BOT] Fatal startup error:', err?.stack || err);
