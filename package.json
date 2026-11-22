@@ -1,0 +1,19 @@
+{
+  "name": "lux-whatsapp-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LUX Guild WhatsApp automation bot",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js && node --check src/forms.js && node --check src/storage.js"
+  },
+  "dependencies": {
+    "@itsliaaa/baileys": "0.5.6",
+    "dotenv": "^16.4.7",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
