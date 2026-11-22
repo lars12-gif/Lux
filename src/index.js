@@ -1,13 +1,10 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
-import qrcode from 'qrcode-terminal';
-import pino from 'pino';
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
-  Browsers
+  fetchLatestBaileysVersion
 } from '@itsliaaa/baileys';
 import { getDB, saveDB } from './storage.js';
 import { getForm, RANKS, POINT_RULES } from './forms.js';
@@ -15,12 +12,11 @@ import { createLuxGroups } from './groups.js';
 
 const PREFIX = process.env.PREFIX || '!lux';
 const OWNER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
-const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || OWNER).replace(/\D/g, '');
 const AUTH_DIR = path.resolve('auth');
 const db = getDB();
-const logger = pino({ level: process.env.LOG_LEVEL || 'warn' });
 let sock;
 let reconnecting = false;
+let socketGeneration = 0;
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 const jidFromNumber = n => `${String(n).replace(/\D/g, '')}@s.whatsapp.net`;
@@ -178,83 +174,104 @@ async function handleCommand(msg) {
   }
 }
 
+async function requestPairingCode(activeSocket, generation, state) {
+  if (state.creds.registered) {
+    log('[PAIRING] هذا الجهاز مرتبط مسبقاً؛ لن يتم طلب رمز جديد.');
+    return;
+  }
+  if (!OWNER) {
+    log('[PAIRING] خطأ: أضف OWNER_NUMBER مع مفتاح الدولة داخل متغيرات الاستضافة.');
+    return;
+  }
+
+  // نفس تسلسل كود الربط الذي أرسلته: انتظار قصير ثم طلب الرمز من نفس socket.
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  if (generation !== socketGeneration || sock !== activeSocket || state.creds.registered) return;
+
+  try {
+    if (typeof activeSocket.requestPairingCode !== 'function') {
+      throw new Error('إصدار @itsliaaa/baileys الحالي لا يوفّر requestPairingCode().');
+    }
+    log('[PAIRING] جاري طلب رمز الربط لرقم المؤسس...');
+    const code = await activeSocket.requestPairingCode(OWNER);
+    console.log('\n================================');
+    console.log('LUX WHATSAPP PAIRING CODE:', code);
+    console.log('================================\n');
+    log('[PAIRING] أدخل الرمز في واتساب > الأجهزة المرتبطة > ربط جهاز برقم الهاتف.');
+  } catch (error) {
+    log('[PAIRING] فشل طلب رمز الربط:', error?.stack || error?.message || error);
+  }
+}
+
 async function start() {
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  let version;
-  try { ({ version } = await fetchLatestBaileysVersion()); } catch { version = undefined; }
-  sock = makeWASocket({
-    auth: state,
-    version,
-    printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
-    logger,
-    markOnlineOnConnect: false,
-    syncFullHistory: false
-  });
+  if (reconnecting === 'starting') return;
+  reconnecting = 'starting';
+  try {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    let version;
+    try { ({ version } = await fetchLatestBaileysVersion()); }
+    catch (error) { log('[BOT] تعذر جلب آخر إصدار؛ سيستخدم الإصدار الافتراضي:', error?.message || error); }
 
-  sock.ev.on('creds.update', saveCreds);
-  let pendingQr = null;
-  let pairingFinished = false;
+    const generation = ++socketGeneration;
+    const activeSocket = makeWASocket({
+      auth: state,
+      version,
+      printQRInTerminal: false,
+      browser: ['LUX BOT', 'Chrome', '1.0.0'],
+      logger: { level: 'silent', trace(){}, debug(){}, info(){}, warn: log, error: log, fatal: log, child(){ return this; } },
+      markOnlineOnConnect: false,
+      syncFullHistory: false
+    });
+    sock = activeSocket;
+    reconnecting = false;
 
-  const showQrFallback = qr => {
-    if (!qr || pairingFinished || sock.__luxPairingCodePrinted) return;
-    console.log('رمز الاقتران لم يصدر؛ هذا QR بديل للربط:');
-    qrcode.generate(qr, { small: true });
-  };
-
-  sock.ev.on('connection.update', async update => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr && !state.creds.registered) {
-      pendingQr = qr;
-      if (pairingFinished) showQrFallback(pendingQr);
-    }
-    if (connection === 'open') {
-      log('تم الاتصال بواتساب كـ', sock.user?.id);
-      if (process.env.AUTO_CREATE_FORMS_CHANNEL === 'true' && !db.channelJid) {
-        try { await createFormsChannel(); }
-        catch (e) { log('تعذر الإنشاء التلقائي للقناة:', e.message); }
+    activeSocket.ev.on('creds.update', saveCreds);
+    activeSocket.ev.on('connection.update', async update => {
+      if (generation !== socketGeneration || sock !== activeSocket) return;
+      const { connection, lastDisconnect } = update;
+      if (connection === 'connecting') log('[BOT] جاري الاتصال بواتساب...');
+      if (connection === 'open') {
+        log('[BOT] تم الاتصال بواتساب بنجاح كـ', activeSocket.user?.id);
+        if (process.env.AUTO_CREATE_FORMS_CHANNEL === 'true' && !db.channelJid) {
+          try { await createFormsChannel(); }
+          catch (e) { log('تعذر الإنشاء التلقائي للقناة:', e.message); }
+        }
       }
-    }
-    if (connection === 'close' && !reconnecting) {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = code === DisconnectReason.loggedOut;
-      if (!loggedOut) {
-        reconnecting = true;
-        setTimeout(() => { reconnecting = false; start().catch(log); }, 5000);
-      } else {
-        log('تم تسجيل الخروج من واتساب. احذف مجلد auth فقط إذا تريد ربط الجهاز من جديد.');
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        log('[BOT] انقطع اتصال واتساب. Status:', code || 'unknown');
+        if (sock === activeSocket) sock = null;
+        if (code === DisconnectReason.loggedOut) {
+          log('[BOT] تم تسجيل الخروج. احتفظ بمجلد auth؛ احذفه فقط إذا تريد إعادة الربط من الصفر.');
+          return;
+        }
+        if (!reconnecting) {
+          reconnecting = true;
+          const delay = code === DisconnectReason.restartRequired ? 1200 : 5000;
+          setTimeout(() => {
+            reconnecting = false;
+            start().catch(err => log('[BOT] Reconnect failed:', err));
+          }, delay);
+        }
       }
-    }
-  });
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      try { await handleCommand(msg); } catch (e) { log('Message handler error:', e); }
-    }
-  });
+    });
 
-  // نفس آلية البوت القديم: انتظر قليلاً بعد إنشاء الاتصال ثم اطلب رمز الاقتران.
-  if (!state.creds.registered && PAIRING_NUMBER) {
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    try {
-      if (typeof sock.requestPairingCode !== 'function') {
-        throw new Error('requestPairingCode غير متوفرة في إصدار Baileys المثبت.');
+    activeSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (!msg.message || msg.key.fromMe) continue;
+        try { await handleCommand(msg); }
+        catch (e) { log('Message handler error:', e); }
       }
-      const code = await sock.requestPairingCode(PAIRING_NUMBER);
-      pairingFinished = true;
-      sock.__luxPairingCodePrinted = true;
-      console.log('\n================================');
-      console.log('رمز اقتران LUX BOT:', code);
-      console.log('================================');
-      console.log('واتساب > الأجهزة المرتبطة > ربط جهاز > الربط برقم الهاتف، ثم أدخل الرمز.\n');
-    } catch (e) {
-      pairingFinished = true;
-      log('تعذر إصدار رمز الاقتران:', e?.message || e);
-      if (pendingQr) showQrFallback(pendingQr);
-      else log('لم يصل QR أيضاً؛ راجع إصدار Baileys وأخطاء الاتصال أعلاه.');
-    }
+    });
+
+    // طلب رمز الربط تلقائياً عند أول تشغيل، مثل الكود المرجعي المرسل.
+    if (!state.creds.registered) void requestPairingCode(activeSocket, generation, state);
+  } catch (err) {
+    reconnecting = false;
+    log('[BOT] Fatal startup error:', err?.stack || err);
+    throw err;
   }
 }
 
